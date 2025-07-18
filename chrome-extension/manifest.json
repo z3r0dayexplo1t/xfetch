@@ -1,0 +1,29 @@
+{
+    "manifest_version": 3,
+    "name": "XFetch Extension",
+    "version": "1.0",
+    "description": "Chrome extension for XFetch",
+    "permissions": [
+      "tabs",
+      "scripting",
+      "cookies",
+      "proxy",
+      "webRequest",
+      "webRequestAuthProvider",
+      "<all_urls>"
+    ],
+    "action": {
+      "default_popup": "popup.html"
+    },
+    "host_permissions": [
+      "<all_urls>"
+    ],
+    "background": {
+      "service_worker": "background.js"
+    },
+    "web_accessible_resources": [{
+      "resources": ["worker.html", "worker.js", "styles/*", "cookieJar.js"],
+      "matches": ["<all_urls>"]
+    }]
+}
+  
