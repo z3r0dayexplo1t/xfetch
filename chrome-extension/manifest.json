@@ -9,11 +9,10 @@
       "cookies",
       "proxy",
       "webRequest",
-      "webRequestAuthProvider",
-      "<all_urls>"
+      "webRequestAuthProvider"
     ],
     "action": {
-      "default_popup": "popup.html"
+      "default_popup": ""
     },
     "host_permissions": [
       "<all_urls>"
