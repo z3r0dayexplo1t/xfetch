@@ -1,25 +1,19 @@
 /**
- * WebSocket server implementation for handling communication between extension and xfetch clients
- * Manages client connections, heartbeats, request routing, and connection health monitoring
+ * WebSocket server implementation using emit.gg
+ * Handles communication between extension and xfetch clients
  */
 
-const WebSocket = require('ws')
-const { v4: uuidv4 } = require('uuid')
+const { EmitApp } = require('emit.gg');
+const heartbeat = require('emit.gg/plugins/heartbeat');
 
 // Server configuration
-const PORT = process.env.PORT || 3006
-const wss = new WebSocket.Server({ port: PORT })
+const PORT = process.env.PORT || 3006;
 
-/**
- * Client and request management
- */
-const clients = {
-    extension: new Map(),
-    xfetch: new Map(),
-}
+// Create emit.gg app
+const app = new EmitApp();
 
-const pendingRequests = new Map()
-const pendingRequestsQueue = new Map()
+// Add heartbeat plugin for connection health monitoring
+app.plugin(heartbeat({ interval: 3000 }));
 
 /**
  * Server statistics tracking
@@ -29,621 +23,359 @@ const stats = {
     requestsSucceeded: 0,
     requestsFailed: 0,
     startTime: Date.now(),
-    connectionStats: {
-        totalConnections: 0,
-        activeConnections: 0,
-        disconnections: 0,
-        reconnections: 0,
-    },
-    heartbeatStats: {
-        sent: 0,
-        received: 0,
-        missed: 0,
-    }
-}
+    extensionClients: 0,
+    xfetchClients: 0,
+};
 
 /**
- * Heartbeat configuration
+ * Pending requests waiting for extension clients
  */
-const HEARTBEAT_CONFIG = {
-    interval: 3000,   // Send heartbeat every 3 seconds
-    timeout: 5000,    // Wait 5 seconds for pong response
-    maxMissed: 3      // Maximum number of missed heartbeats before considering client unhealthy
-}
-
-// Log server startup
-console.log(`WebSocket server started on port ${PORT}`);
+const pendingRequests = new Map();
 
 /**
- * Periodic cleanup and stats reporting
+ * Middleware: Log all events
  */
-const CLEANUP_INTERVAL = 1000 * 60 * 2; // 2 minutes
-setInterval(() => {
-    const now = Date.now();
-
-    // Clean up expired requests
-    for (const [id, request] of pendingRequests.entries()) {
-        if (now - request.timestamp > CLEANUP_INTERVAL) {
-            pendingRequests.delete(id);
-        }
-    }
-
-    // Log server statistics
-    console.log(`
-        Connection stats:
-          - Extension clients: ${clients.extension.size}
-          - Xfetch clients: ${clients.xfetch.size}
-          - Total connections: ${stats.connectionStats.totalConnections}
-          - Active connections: ${stats.connectionStats.activeConnections}
-          - Disconnections: ${stats.connectionStats.disconnections}
-          - Reconnections: ${stats.connectionStats.reconnections}
-        Heartbeat stats:
-          - Sent: ${stats.heartbeatStats.sent}
-          - Received: ${stats.heartbeatStats.received}
-          - Missed: ${stats.heartbeatStats.missed}
-        Request stats:
-          - Pending requests: ${pendingRequests.size}
-          - Processed: ${stats.requestsProcessed}
-          - Succeeded: ${stats.requestsSucceeded}
-          - Failed: ${stats.requestsFailed}
-    `);
-}, CLEANUP_INTERVAL);
+app.use((req, next) => {
+    console.log(`[${req.socket.id}] ${req.event}`, req.data ? `(${JSON.stringify(req.data).substring(0, 100)})` : '');
+    next();
+});
 
 /**
- * Heartbeat management
+ * System Event: Client connected
  */
-const heartbeatInterval = setInterval(() => {
-    sendHeartbeats('extension');
-    sendHeartbeats('xfetch');
-    checkClientHealth('extension');
-    checkClientHealth('xfetch');
-}, HEARTBEAT_CONFIG.interval);
+app.on('@connection', ({ socket, app, info }) => {
+    console.log(`Client connected: ${socket.id}`);
+    console.log(`  IP: ${info.ip}`);
+    console.log(`  Query:`, info.query);
+
+    // Request client identification
+    socket.emit('@identify', { message: 'Please identify your client type' });
+});
 
 /**
- * Sends heartbeat pings to all clients of a specific type
+ * System Event: Client disconnected
  */
-function sendHeartbeats(clientType) {
-    for (const [clientId, clientData] of clients[clientType].entries()) {
-        const client = clientData.client;
-        if (client.readyState === WebSocket.OPEN) {
-            try {
-                clientData.lastPingSent = Date.now();
-                clientData.awaitingPong = true;
+app.on('@disconnect', ({ socket, app }) => {
+    const clientType = socket.data.clientType;
+    console.log(`Client disconnected: ${socket.id} (${clientType || 'unknown'})`);
 
-                // Send ping message
-                client.send(JSON.stringify({
-                    type: 'ping',
-                    timestamp: Date.now(),
-                    interval: HEARTBEAT_CONFIG.interval,
-                    server: 'socket-server' // Identify this as a server ping
-                }));
-
-                stats.heartbeatStats.sent++;
-
-                // Set timeout for pong response
-                clientData.pongTimeoutId = setTimeout(() => {
-                    if (clientData.awaitingPong && clientData.client.readyState === WebSocket.OPEN) {
-                        clientData.missedHeartbeats++;
-                        stats.heartbeatStats.missed++;
-                        clientData.awaitingPong = false;
-
-                        // Update client health status
-                        clientData.healthStatus = clientData.missedHeartbeats >= HEARTBEAT_CONFIG.maxMissed
-                            ? 'critical'
-                            : 'degraded';
-
-                        console.log(`Client ${clientType} ${clientId} missed heartbeat: ${clientData.missedHeartbeats}/${HEARTBEAT_CONFIG.maxMissed}`);
-                    }
-                }, HEARTBEAT_CONFIG.timeout);
-            } catch (err) {
-                console.log({
-                    type: 'error',
-                    from: 'sendHeartbeats',
-                    message: err.message
-                });
-            }
-        }
-    }
-}
-
-/**
- * Checks health of all clients of a specific type
- */
-function checkClientHealth(clientType) {
-    for (const [clientId, clientData] of clients[clientType].entries()) {
-        if (clientData.missedHeartbeats >= HEARTBEAT_CONFIG.maxMissed) {
-            if (clientData.pongTimeoutId) {
-                clearTimeout(clientData.pongTimeoutId);
-            }
-
-            try {
-                if (clientData.client.readyState === WebSocket.OPEN) {
-                    clientData.client.terminate();
-                }
-            } catch (err) {
-                // Ignore errors when terminating already dead connections
-            }
-
-            // Clean up client data and update stats
-            clients[clientType].delete(clientId);
-            stats.connectionStats.disconnections++;
-            stats.connectionStats.activeConnections--;
-
-            // Clean up pending requests for terminated client
-            for (const [requestId, request] of pendingRequests.entries()) {
-                if (request && request.client && request.client === clientData.client) {
-                    pendingRequests.delete(requestId);
-                    stats.requestsFailed++;
-                }
-            }
-        }
-    }
-}
-
-/**
- * Sends a message to the healthiest available extension client
- */
-function sendToExtension(message) {
-    if (clients.extension.size === 0) {
-        return false;
+    // Update stats
+    if (clientType === 'extension') {
+        stats.extensionClients = Math.max(0, stats.extensionClients - 1);
+        notifyXfetchClients();
+    } else if (clientType === 'xfetch') {
+        stats.xfetchClients = Math.max(0, stats.xfetchClients - 1);
     }
 
-    const msg = JSON.stringify(message);
-
-    // Find the healthiest available extension client
-    let bestClient = null;
-    let bestHealth = -1;
-
-    for (const [clientId, clientData] of clients.extension.entries()) {
-        const client = clientData.client;
-        if (client.readyState === WebSocket.OPEN) {
-            const healthScore = clientData.healthStatus === 'healthy' ? 2 :
-                clientData.healthStatus === 'degraded' ? 1 : 0;
-
-            if (healthScore > bestHealth) {
-                bestClient = client;
-                bestHealth = healthScore;
-
-                if (healthScore === 2) break; // Found a healthy client, no need to continue
-            }
-        }
-    }
-
-    if (bestClient && bestClient.readyState === WebSocket.OPEN) {
-        try {
-            bestClient.send(msg);
-            return true;
-        } catch (err) {
-            console.log({
-                type: 'error',
-                from: 'sendToExtension',
-                message: err.message
-            });
-        }
-    }
-
-    return false;
-}
-
-/**
- * Sends a message to a specific xfetch client
- */
-function sendToXfetch(client, message) {
-    if (client.readyState !== WebSocket.OPEN) {
-        return false;
-    }
-
-    const msg = JSON.stringify(message);
-    try {
-        client.send(msg);
-        return true;
-    } catch (err) {
-        console.log({
-            type: 'error',
-            from: 'sendToXfetch',
-            message: err.message
-        });
-        return false;
-    }
-}
-
-/**
- * Notifies all xfetch clients about extension availability
- */
-function notifyXfetchClients(available) {
-    const messageType = available ? 'extensionAvailable' : 'extensionUnavailable';
-    console.log(`Notifying xfetch clients about ${messageType}`);
-
-    for (const [xfetchId, xfetchData] of clients.xfetch.entries()) {
-        const xfetchClient = xfetchData.client;
-        if (xfetchClient && xfetchClient.readyState === WebSocket.OPEN) {
-            try {
-                xfetchClient.send(JSON.stringify({
-                    type: messageType,
-                    timestamp: Date.now()
-                }));
-            } catch (err) {
-                console.log({
-                    type: 'error',
-                    from: `notify${available ? 'Available' : 'Unavailable'}`,
-                    message: err.message
-                });
-            }
-        }
-    }
-}
-
-/**
- * Handles pending request validation and routing
- */
-function validateExtensionClients(message, ws, clientId, count) {
-    if (clients.extension.size === 0 && count < 3) {
-        console.log(`No extension clients available, attempt ${count + 1}/3. Waiting 3s for clients...`);
-
-        // Clear any existing timeout for this request ID
-        const existingQueueItem = pendingRequestsQueue.get(message.id);
-        if (existingQueueItem && existingQueueItem.timeoutId) {
-            clearTimeout(existingQueueItem.timeoutId);
-        }
-
-        // Add to queue with new timeout - store the full original message
-        pendingRequestsQueue.set(message.id, {
-            client: ws,
-            timestamp: Date.now(),
-            id: message.id,
-            url: message.url,
-            clientId: clientId,
-            originalMessage: message,  // Store the entire original message
-            timeoutId: setTimeout(() => {
-                console.log(`Retry attempt ${count + 1} for request ${message.id}`);
-                pendingRequestsQueue.delete(message.id);
-                validateExtensionClients(message, ws, clientId, count + 1);
-            }, 2000)
-        });
-
-        // Don't send any response to the client yet - we're waiting
-    } else if (clients.extension.size === 0 && count >= 3) {
-        console.log(`Max retries (3) reached for request ${message.id}. No extension clients available.`);
-        pendingRequestsQueue.delete(message.id);
-        ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({
-            id: message.id,
-            error: 'No extension clients available after maximum retries',
-            response: null
-        }));
-        pendingRequests.delete(message.id);
-        stats.requestsFailed++;
-        stats.requestsProcessed++;
-    } else if (clients.extension.size > 0) {
-        console.log(`Found ${clients.extension.size} extension clients, sending request ${message.id}`);
-        const sent = sendToExtension(message);
-        if (!sent) {
-            console.log(`Failed to send request ${message.id} to extension clients`);
-            pendingRequestsQueue.delete(message.id);
-            ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({
-                id: message.id,
-                error: 'Failed to send request to extension clients',
-                response: null
-            }));
-            pendingRequests.delete(message.id);
+    // Clean up pending requests for this client
+    for (const [requestId, request] of pendingRequests.entries()) {
+        if (request.socketId === socket.id) {
+            pendingRequests.delete(requestId);
             stats.requestsFailed++;
-            stats.requestsProcessed++;
-
-            if (clients.xfetch.has(clientId)) {
-                const clientData = clients.xfetch.get(clientId);
-                clientData.requestsProcessed++;
-                clientData.requestsFailed++;
-                clients.xfetch.set(clientId, clientData);
-            }
-        } else {
-            console.log(`Successfully sent request ${message.id} to extension client`);
         }
-    } else {
-        console.log(`Unexpected condition for request ${message.id}`);
-        pendingRequestsQueue.delete(message.id);
-        ws.send(JSON.stringify({
-            id: message.id,
-            error: 'Unexpected server condition',
-            response: null
-        }));
-        pendingRequests.delete(message.id);
-        stats.requestsFailed++;
-        stats.requestsProcessed++;
     }
-}
+});
 
 /**
- * WebSocket connection handler
+ * System Event: Heartbeat ping
  */
-wss.on('connection', (ws, req) => {
-    const clientIp = req.socket.remoteAddress;
-    const clientId = uuidv4();
-    ws.id = clientId;
-    ws.clientType = 'unknown';
+app.on('@ping', (req) => {
+    const clientType = req.get('clientType') || 'unknown';
+    console.log(`Heartbeat from ${clientType} client: ${req.id}`);
+});
 
-    // Update connection statistics
-    stats.connectionStats.totalConnections++;
-    stats.connectionStats.activeConnections++;
+/**
+ * Event: Client identification
+ */
+app.on('/identify', (req) => {
+    const { clientType } = req.data;
 
-    // Send welcome message requesting client identification
-    ws.send(JSON.stringify({
-        type: 'identify',
-        message: 'Welcome to the xfetch socket server, please identify yourself'
-    }));
-
-    /**
-     * Message handler for incoming WebSocket messages
-     */
-    ws.on('message', (messageData) => {
-        try {
-            const message = JSON.parse(messageData);
-
-            // Handle heartbeat pong responses
-            if (message.type === 'pong') {
-                handlePongResponse(ws, clientId);
-                return;
-            }
-
-            // Handle ping requests from clients
-            if (message.type === 'ping') {
-                // Send pong response immediately
-                ws.send(JSON.stringify({
-                    type: 'pong',
-                    timestamp: Date.now(),
-                    server: 'socket-server' // Identify this as a server response
-                }));
-                return;
-            }
-
-            // Handle client identification
-            if (message.clientType === 'xfetch' || message.clientType === 'extension') {
-                handleClientIdentification(ws, message, clientId, clientIp);
-                return;
-            }
-
-            // Handle request messages from xfetch clients
-            if (ws.clientType === 'xfetch' && message.url && message.options && message.id !== undefined) {
-                handleXfetchRequest(ws, message, clientId);
-                return;
-            }
-
-            // Handle response messages from extension clients
-            if (ws.clientType === 'extension' && message.id !== undefined) {
-                handleExtensionResponse(ws, message, clientId);
-                return;
-            }
-
-        } catch (err) {
-            console.log({
-                type: 'error',
-                from: 'HandleMessage',
-                message: err.message
-            });
-        }
-    });
-
-    /**
-     * Handler for pong responses
-     */
-    function handlePongResponse(ws, clientId) {
-        const clientType = ws.clientType;
-        if (clientType !== 'unknown' && clients[clientType].has(clientId)) {
-            const clientData = clients[clientType].get(clientId);
-
-            // Reset heartbeat tracking
-            if (clientData.pongTimeoutId) {
-                clearTimeout(clientData.pongTimeoutId);
-                clientData.pongTimeoutId = null;
-            }
-
-            clientData.awaitingPong = false;
-            clientData.lastPongReceived = Date.now();
-            clientData.lastActivity = Date.now();
-
-            // Restore client health if it was degraded
-            if (clientData.missedHeartbeats > 0 && clientData.missedHeartbeats < HEARTBEAT_CONFIG.maxMissed) {
-                clientData.healthStatus = 'healthy';
-            }
-
-            clientData.missedHeartbeats = 0;
-            stats.heartbeatStats.received++;
-            clients[clientType].set(clientId, clientData);
-        }
+    if (!clientType || (clientType !== 'extension' && clientType !== 'xfetch')) {
+        req.emit('@error', { error: 'Invalid client type. Must be "extension" or "xfetch"' });
+        return;
     }
 
-    /**
-     * Handler for client identification
-     */
-    function handleClientIdentification(ws, message, clientId, clientIp) {
-        const clientType = message.clientType;
-        const isReconnection = ws.clientType !== 'unknown';
-        ws.clientType = clientType;
+    // Store client type
+    req.set('clientType', clientType);
 
-        // Initialize client data
-        clients[clientType].set(clientId, {
-            client: ws,
-            id: clientId,
-            connectedAt: Date.now(),
-            lastActivity: Date.now(),
-            lastPingSent: null,
-            lastPongReceived: null,
-            awaitingPong: false,
-            missedHeartbeats: 0,
-            healthStatus: 'healthy',
-            pongTimeoutId: null,
-            ipAddress: clientIp,
-            requestsProcessed: 0,
-            requestsSucceeded: 0,
-            requestsFailed: 0,
-            avgResponseTime: 0
-        });
+    // Add tag for easy filtering
+    req.tag(`*${clientType}`);
 
-        if (isReconnection) {
-            stats.connectionStats.reconnections++;
-        }
-
-        console.log(`Client ${clientType} connected from ${clientIp} with ID ${clientId}`);
-
-        //send identification confirmation
-        ws.send(JSON.stringify({ type: 'identified' }));
-
-        if (clientType === 'xfetch') {
-            ws.send(JSON.stringify({
-                type: clients.extension.size === 1 ? 'extensionAvailable' : 'extensionUnavailable'
-            }))
-        }
-
-        // If this is an extension client, notify xfetch clients
-        if (clientType === 'extension' && clients.extension.size === 1) {
-            notifyXfetchClients('extensionAvailable');
-        }
-
+    // Update stats
+    if (clientType === 'extension') {
+        stats.extensionClients++;
+    } else if (clientType === 'xfetch') {
+        stats.xfetchClients++;
     }
 
-    /**
-     * Handler for xfetch client requests
-     */
-    function handleXfetchRequest(ws, message, clientId) {
-        // Update client activity
-        if (clients.xfetch.has(clientId)) {
-            const clientData = clients.xfetch.get(clientId);
-            clientData.lastActivity = Date.now();
-            clients.xfetch.set(clientId, clientData);
-        }
+    console.log(`Client ${req.id} identified as ${clientType}`);
+    console.log(`  Extension clients: ${stats.extensionClients}`);
+    console.log(`  Xfetch clients: ${stats.xfetchClients}`);
 
-        // Store request details
-        pendingRequests.set(message.id, {
-            client: ws,
+    // Send confirmation
+    req.emit('@identified', { clientType });
+
+    // If this is an xfetch client, tell them about extension availability
+    if (clientType === 'xfetch') {
+        const available = stats.extensionClients > 0;
+        req.emit('@extension-status', { available });
+    }
+
+    // If this is the first extension, notify all xfetch clients
+    if (clientType === 'extension' && stats.extensionClients === 1) {
+        notifyXfetchClients();
+    }
+});
+
+/**
+ * Event: Fetch request from xfetch client
+ */
+app.on('/fetch', async (req) => {
+    const clientType = req.get('clientType');
+
+    // Validate client type
+    if (clientType !== 'xfetch') {
+        req.reply({ error: 'Only xfetch clients can send fetch requests' });
+        return;
+    }
+
+    const { url, options, id: requestId } = req.data;
+
+    if (!url || !requestId) {
+        req.reply({ error: 'Missing required fields: url, id' });
+        return;
+    }
+
+    // Check if extension clients are available
+    if (stats.extensionClients === 0) {
+        // Store request for retry
+        storePendingRequest(requestId, req.id, url, options, req);
+
+        // Wait a bit for extensions to connect
+        setTimeout(() => retryPendingRequest(requestId), 2000);
+        return;
+    }
+
+    // Forward request to extension clients
+    const sent = await forwardToExtension(requestId, url, options);
+
+    if (!sent) {
+        req.reply({ error: 'Failed to forward request to extension' });
+        stats.requestsFailed++;
+    } else {
+        // Store pending request
+        pendingRequests.set(requestId, {
+            socketId: req.id,
             timestamp: Date.now(),
-            id: message.id,
-            url: message.url,
-            options: message.options,
-            clientId: clientId
+            url,
+            options
         });
+    }
+});
 
-        // Check if any extension clients are available
-        validateExtensionClients(message, ws, clientId, 0);
+/**
+ * Event: Response from extension client
+ */
+app.on('/response', (req) => {
+    const clientType = req.get('clientType');
+
+    // Validate client type
+    if (clientType !== 'extension') {
+        req.emit('@error', { error: 'Only extension clients can send responses' });
+        return;
     }
 
-    /**
-     * Handler for extension client responses
-     */
-    function handleExtensionResponse(ws, message, clientId) {
-        // Update client activity
-        if (clients.extension.has(clientId)) {
-            const clientData = clients.extension.get(clientId);
-            clientData.lastActivity = Date.now();
-            clients.extension.set(clientId, clientData);
-        }
+    const { id: requestId, response, error } = req.data;
 
-        // Process response
-        const pendingRequest = pendingRequests.get(message.id);
-        if (pendingRequest) {
-            const xfetchClient = pendingRequest.client;
-            const requestClientId = pendingRequest.clientId;
-            const responseTime = Date.now() - pendingRequest.timestamp;
-
-            // Forward response to xfetch client
-            if (xfetchClient && xfetchClient.readyState === WebSocket.OPEN) {
-                sendToXfetch(xfetchClient, message);
-            }
-
-            // Update global stats
-            stats.requestsProcessed++;
-            if (message.response) {
-                stats.requestsSucceeded++;
-            } else {
-                stats.requestsFailed++;
-            }
-
-            // Update extension client stats
-            if (clients.extension.has(clientId)) {
-                const clientData = clients.extension.get(clientId);
-                clientData.requestsProcessed++;
-                if (message.response) {
-                    clientData.requestsSucceeded++;
-                } else {
-                    clientData.requestsFailed++;
-                }
-                clients.extension.set(clientId, clientData);
-            }
-
-            // Update xfetch client stats and response time
-            if (requestClientId !== undefined && clients.xfetch.has(requestClientId)) {
-                const clientData = clients.xfetch.get(requestClientId);
-                clientData.requestsProcessed++;
-                if (message.response) {
-                    clientData.requestsSucceeded++;
-                    // Update average response time with exponential moving average
-                    if (clientData.avgResponseTime === 0) {
-                        clientData.avgResponseTime = responseTime;
-                    } else {
-                        clientData.avgResponseTime = 0.7 * clientData.avgResponseTime + 0.3 * responseTime;
-                    }
-                } else {
-                    clientData.requestsFailed++;
-                }
-                clients.xfetch.set(requestClientId, clientData);
-            } else {
-                console.log(`No xfetch client found for request ${message.id}`);
-            }
-
-            pendingRequests.delete(message.id);
-        }
+    if (!requestId) {
+        req.emit('@error', { error: 'Missing request id' });
+        return;
     }
 
-    // Handle client disconnection
-    ws.on('close', () => {
-        const wasExtension = ws.clientType === 'extension';
-        clients[ws.clientType].delete(clientId);
+    // Find the pending request
+    const pendingRequest = pendingRequests.get(requestId);
 
-        // Clean up pending requests for disconnected client
-        for (const [id, request] of pendingRequests.entries()) {
-            if (request.client === ws) {
-                pendingRequests.delete(id);
-            }
-        }
+    if (!pendingRequest) {
+        console.log(`Received response for unknown request: ${requestId}`);
+        return;
+    }
 
-        // If this was the last extension client, notify all xfetch clients
-        if (wasExtension && clients.extension.size === 0) {
-            notifyXfetchClients(false);
-        }
+    // Update stats
+    stats.requestsProcessed++;
+    if (response) {
+        stats.requestsSucceeded++;
+    } else {
+        stats.requestsFailed++;
+    }
 
-        stats.connectionStats.disconnections++;
-        console.log(`Client ${ws.clientType} disconnected from ${clientIp} with ID ${clientId}`);
+    const responseTime = Date.now() - pendingRequest.timestamp;
+    console.log(`Request ${requestId} completed in ${responseTime}ms`);
+
+    // Forward response to xfetch client
+    app.emitTo(pendingRequest.socketId, '/fetch-response', {
+        id: requestId,
+        response,
+        error
     });
 
-    // If there are no extension clients, notify this client
-    if (ws.clientType === 'xfetch' && clients.extension.size === 0) {
-        sendToXfetch(ws, { type: 'extensionUnavailable' });
-    }
+    // Clean up
+    pendingRequests.delete(requestId);
+});
 
-    // Handle WebSocket errors
-    ws.on('error', (err) => {
-        console.log({
-            type: 'error',
-            from: 'WebSocket Error',
-            message: err.message
-        });
+/**
+ * Event: Get server stats
+ */
+app.on('/stats', (req) => {
+    req.reply({
+        ...stats,
+        uptime: Date.now() - stats.startTime,
+        pendingRequests: pendingRequests.size,
     });
 });
 
 /**
- * Graceful shutdown handler
+ * Helper: Forward request to extension client
+ */
+async function forwardToExtension(id, url, options) {
+    try {
+        // Broadcast to all extension clients (they'll handle it)
+        app.broadcast('/fetch-request', {
+            data: { id, url, options },
+            to: '*extension'
+        });
+        return true;
+    } catch (err) {
+        console.error('Error forwarding to extension:', err.message);
+        return false;
+    }
+}
+
+/**
+ * Helper: Store pending request for retry
+ */
+function storePendingRequest(requestId, socketId, url, options, req) {
+    if (!pendingRequests.has(requestId)) {
+        pendingRequests.set(requestId, {
+            socketId,
+            timestamp: Date.now(),
+            url,
+            options,
+            retries: 0,
+            req
+        });
+        console.log(`Stored pending request ${requestId} (no extensions available)`);
+    }
+}
+
+/**
+ * Helper: Retry pending request
+ */
+async function retryPendingRequest(requestId) {
+    const pending = pendingRequests.get(requestId);
+
+    if (!pending) {
+        return; // Already processed
+    }
+
+    pending.retries++;
+
+    if (stats.extensionClients > 0) {
+        // Extension is now available, send the request
+        console.log(`Retrying pending request ${requestId} (attempt ${pending.retries})`);
+        const sent = await forwardToExtension(requestId, pending.url, pending.options);
+
+        if (!sent) {
+            // Failed to send, retry or give up
+            if (pending.retries < 3) {
+                setTimeout(() => retryPendingRequest(requestId), 2000);
+            } else {
+                // Give up
+                app.emitTo(pending.socketId, '/fetch-response', {
+                    id: requestId,
+                    error: 'Failed to forward request to extension after 3 retries'
+                });
+                pendingRequests.delete(requestId);
+                stats.requestsFailed++;
+            }
+        }
+    } else {
+        // Still no extensions, retry or give up
+        if (pending.retries < 3) {
+            setTimeout(() => retryPendingRequest(requestId), 2000);
+        } else {
+            // Give up
+            app.emitTo(pending.socketId, '/fetch-response', {
+                id: requestId,
+                error: 'No extension clients available after 3 retry attempts'
+            });
+            pendingRequests.delete(requestId);
+            stats.requestsFailed++;
+        }
+    }
+}
+
+/**
+ * Helper: Notify all xfetch clients about extension availability
+ */
+function notifyXfetchClients() {
+    const available = stats.extensionClients > 0;
+    console.log(`Notifying xfetch clients: extensions ${available ? 'available' : 'unavailable'}`);
+
+    app.broadcast('@extension-status', {
+        data: { available },
+        to: '*xfetch'
+    });
+}
+
+/**
+ * Periodic cleanup and stats reporting
+ */
+setInterval(() => {
+    const now = Date.now();
+
+    // Clean up expired requests (older than 2 minutes)
+    for (const [id, request] of pendingRequests.entries()) {
+        if (now - request.timestamp > 120000) {
+            console.log(`Cleaning up expired request: ${id}`);
+            pendingRequests.delete(id);
+            stats.requestsFailed++;
+        }
+    }
+
+    // Log stats
+    console.log(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Server Statistics:
+  Uptime: ${Math.floor((now - stats.startTime) / 1000)}s
+  Extension clients: ${stats.extensionClients}
+  Xfetch clients: ${stats.xfetchClients}
+  Pending requests: ${pendingRequests.size}
+  Requests processed: ${stats.requestsProcessed}
+  Requests succeeded: ${stats.requestsSucceeded}
+  Requests failed: ${stats.requestsFailed}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    `);
+}, 120000); // Every 2 minutes
+
+/**
+ * Start the server
+ */
+app.listen(PORT, () => {
+    console.log(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚀 xfetch WebSocket server (emit.gg)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Listening on: ws://localhost:${PORT}
+   Started at: ${new Date().toISOString()}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    `);
+});
+
+/**
+ * Graceful shutdown
  */
 process.on('SIGINT', () => {
-    console.log('Shutting down WebSocket server...');
-
-    // Clear intervals
-    clearInterval(heartbeatInterval);
-
-    // Close all connections
-    wss.clients.forEach((client) => {
-        client.close();
-    });
-
-    // Close the server
-    wss.close(() => {
-        console.log('WebSocket server closed');
-        process.exit(0);
-    });
+    console.log('\n\nShutting down server...');
+    app.close();
+    process.exit(0);
 });

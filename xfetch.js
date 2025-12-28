@@ -1,412 +1,311 @@
-const WebSocket = require('ws');
+const { EmitClient } = require('emit.gg/client');
 const { v4: uuidv4 } = require('uuid');
-
-
 
 class Xfetch {
     constructor(wsUrl, options = {}) {
-
-        //configuration with defaults
+        // Configuration with defaults
         this.config = {
-            timeout: options.timeout || 5000,
+            timeout: options.timeout || 30000,
             maxRetries: options.maxRetries || 3,
-            heartbeatInterval: options.heartbeatInterval || 15000,
-            queueCheckInterval: options.queueCheckInterval || 1000
-        }
+            reconnect: options.reconnect !== false, // Default to true
+            reconnectDelay: options.reconnectDelay || 1000,
+            maxReconnectAttempts: options.maxReconnectAttempts || 10,
+        };
 
-        this.cookies = new Map()
+        this.cookies = new Map();
         this.wsUrl = wsUrl;
-        this.ws = new WebSocket(wsUrl)
+        this.socket = null;
         this.isConnected = false;
         this.extensionAvailable = false;
         this.isIdentified = false;
-        this.pendingRequests = new Object();
-        this.requestQueue = new Array()
-        this._giveUpTimers = new Array();
-        this.reconnectAttempts = 0;
-        this.maxReconnectAttempts = this.config.maxRetries;
-        this.reconnectDelay = this.config.timeout;
-        
+        this.pendingRequests = new Map();
+        this.requestQueue = [];
 
-        this.setupWebSocket();
-        this.heartBeatTimer = setInterval(() => this.sendHeartbeat(), this.config.heartbeatInterval);
-        this.queueCheckTimer = setInterval(() => this.processQueue(), this.config.queueCheckInterval);
-
-
+        this._initSocket();
     }
 
     log(message, type = 'INFO', origin = 'Xfetch') {
         try {
-
-            type === 'ERROR' ? console.log(`\x1b[31m[Xfetch-${type}]\x1b[0m ${message} - ${new Date().toISOString()} @${origin}`) :
-                type === 'WARN' ? console.log(`\x1b[33m[Xfetch-${type}]\x1b[0m ${message} - ${new Date().toISOString()} @${origin}`) :
-                    type === 'DEBUG' ? console.log(`\x1b[32m[Xfetch-${type}]\x1b[0m ${message} - ${new Date().toISOString()} @${origin}`) :
-                        console.log(`\x1b[34m[Xfetch-${type}]\x1b[0m ${message} - ${new Date().toISOString()} @${origin}`);
-
+            const colors = {
+                ERROR: '\x1b[31m',
+                WARN: '\x1b[33m',
+                DEBUG: '\x1b[32m',
+                INFO: '\x1b[34m',
+            };
+            const color = colors[type] || colors.INFO;
+            console.log(`${color}[Xfetch-${type}]\x1b[0m ${message} - ${new Date().toISOString()} @${origin}`);
         } catch (err) {
-
             console.log(`\x1b[31m[Xfetch-ERROR]\x1b[0m Failed to log message: ${err.message}`);
         }
-
-
-
     }
 
+    async _initSocket() {
+        try {
+            this.log('Connecting to WebSocket server...', 'INFO', '_initSocket');
 
-    setupWebSocket() {
-        //handle incoming websocket messages 
-        this.ws.onmessage = ((event) => {
-            try {
-                const data = JSON.parse(event.data);
+            this.socket = await EmitClient.connect(this.wsUrl, {
+                reconnect: this.config.reconnect,
+                reconnectDelay: this.config.reconnectDelay,
+                maxRetries: this.config.maxReconnectAttempts,
+                connectTimeout: this.config.timeout,
+            });
 
-                if (data.type === 'ping') {
-                    this.sendPong();
-                    return
-                } else if (data.type === 'extensionAvailable') {
-                    this.log(`Extension client now available, processing queue...`, null, 'setupWebSocket');
-                    this.extensionAvailable = true;
-                    this.processQueue();
-                    return
-                } else if (data.type === 'extensionUnavailable') {
-                    this.log(`Extension client no longer available, requests will be queued`, 'WARN', 'setupWebSocket');
-                    this.extensionAvailable = false;
-                    return
-                } else if (data.type === 'identified') {
-                    this.isIdentified = true; 
-                    this.log('Received identification confirmation', 'INFO', 'setupWebSocket'); 
-                    this.isIdentifiedTimer ? clearInterval(this.isIdentifiedTimer) : null; 
-                    return; 
-                }
+            this._setupEventHandlers();
 
-                // handle response messages 
-
-                const { id, response, error } = data;
-                if (id !== undefined && this.pendingRequests[id]) {
-                    //clear timeout for this request
-                    if (this.pendingRequests[id].timeoutId) {
-                        clearTimeout(this.pendingRequests[id].timeoutId)
-                    }
-
-                    error
-                        ? this.pendingRequests[id].reject(error)
-                        : this.pendingRequests[id].resolve(response)
-
-                   response.cookies && this.setCookies(response.url, [...response.cookies.map((cookie) => ({name: cookie.name, value: cookie.value}))])
-
-
-                    delete this.pendingRequests[id];
-                }
-
-            } catch (err) {
-                this.log(`Error handling message: ${err.message}`, 'ERROR', 'setupWebSocket');
-            }
-        })
-
-
-
-
-        // Handle connection events 
-        this.ws.onopen = () => {
-            this.log('WebSocket connection established', 'INFO', 'setupWebSocket');
+            // Connection is established, set flags
             this.isConnected = true;
-            this.reconnectAttempts = 0;
+            this.log('WebSocket connection established', 'INFO', '_initSocket');
 
-            //clear give up timers
-            if (this._giveUpTimers) {
-                this._giveUpTimers.forEach(timer => clearTimeout(timer));
-                this._giveUpTimers = new Array();
-            }
-
-
-            this.sendClientIdentification();
-            this.processQueue();
-
+            // Identify with server
+            this._identifyClient();
+        } catch (err) {
+            this.log(`Failed to connect: ${err.message}`, 'ERROR', '_initSocket');
+            throw err;
         }
+    }
 
+    _setupEventHandlers() {
+        // Connection established
+        this.socket.on('@connection', () => {
+            this.log('Connected to server', 'INFO', '_setupEventHandlers');
+            this.isConnected = true;
+            this._identifyClient();
+        });
 
-        this.ws.onclose = () => {
-            this.log('WebSocket connection closed', 'WARN', 'setupWebSocket');
+        // Disconnection
+        this.socket.on('@disconnect', () => {
+            this.log('Disconnected from server', 'WARN', '_setupEventHandlers');
             this.isConnected = false;
             this.extensionAvailable = false;
+            this.isIdentified = false;
 
-            //Reject any pending requests
-            Object.keys(this.pendingRequests).forEach((id) => {
-                if (this.pendingRequests[id].timeoutId) {
-                    clearTimeout(this.pendingRequests[id].timeoutId);
+            // Reject all pending requests
+            for (const [id, pending] of this.pendingRequests.entries()) {
+                if (pending.timeoutId) {
+                    clearTimeout(pending.timeoutId);
                 }
-                this.pendingRequests[id].reject(new Error('WebSocket connection closed'));
-                delete this.pendingRequests[id];
-            })
+                pending.reject(new Error('WebSocket connection closed'));
+                this.pendingRequests.delete(id);
+            }
+        });
 
+        // Reconnection
+        this.socket.on('@reconnect', () => {
+            this.log('Reconnected to server', 'INFO', '_setupEventHandlers');
+            this.isConnected = true;
+            this._identifyClient();
+            this._processQueue();
+        });
 
-            //Attempt to reconnect with exponential backoff
-            if (this.reconnectAttempts < this.maxReconnectAttempts) {
-                this.reconnectAttempts++;
-                const delay = this.reconnectDelay * Math.min(this.reconnectAttempts, 5);
-                setTimeout(() => this.reconnect(), delay);
+        // Server requests identification
+        this.socket.on('@identify', () => {
+            this.log('Server requesting identification', 'DEBUG', '_setupEventHandlers');
+            this._identifyClient();
+        });
+
+        // Identification confirmed
+        this.socket.on('@identified', (data) => {
+            this.log(`Identification confirmed: ${data.clientType}`, 'INFO', '_setupEventHandlers');
+            this.isIdentified = true;
+            this._processQueue();
+        });
+
+        // Extension availability status
+        this.socket.on('@extension-status', (data) => {
+            const wasAvailable = this.extensionAvailable;
+            this.extensionAvailable = data.available;
+
+            if (this.extensionAvailable && !wasAvailable) {
+                this.log('Extension client now available, processing queue...', 'INFO', '_setupEventHandlers');
+                this._processQueue();
+            } else if (!this.extensionAvailable && wasAvailable) {
+                this.log('Extension client no longer available, requests will be queued', 'WARN', '_setupEventHandlers');
+            }
+        });
+
+        // Fetch response from extension
+        this.socket.on('/fetch-response', (data) => {
+            const { id, response, error } = data;
+
+            if (!id || !this.pendingRequests.has(id)) {
+                this.log(`Received response for unknown request: ${id}`, 'WARN', '_setupEventHandlers');
+                return;
             }
 
+            const pending = this.pendingRequests.get(id);
 
-            this.ws.onerror = (error) => {
-                this.log(`WebSocket error: ${error.message}`, 'ERROR', 'setupWebSocket');
+            // Clear timeout
+            if (pending.timeoutId) {
+                clearTimeout(pending.timeoutId);
             }
-        }
 
+            // Store cookies if present
+            if (response && response.cookies) {
+                this.setCookies(response.url || pending.url, response.cookies);
+            }
 
+            // Resolve or reject the promise
+            if (error) {
+                this.log(`Request ${id} failed: ${error}`, 'ERROR', '_setupEventHandlers');
+                pending.reject(new Error(error));
+            } else {
+                this.log(`Request ${id} succeeded`, 'DEBUG', '_setupEventHandlers');
+                pending.resolve(response);
+            }
+
+            this.pendingRequests.delete(id);
+        });
+
+        // Error handling
+        this.socket.on('@error', (data) => {
+            this.log(`Server error: ${data.error || 'Unknown error'}`, 'ERROR', '_setupEventHandlers');
+        });
     }
 
-
-    processQueue() {
-        if(this.requestQueue.length === 0){
+    _identifyClient() {
+        if (!this.socket || !this.socket.connected) {
+            this.log('Cannot identify: socket not connected', 'WARN', '_identifyClient');
             return;
         }
 
-        const canProcess = this.requestQueue.length > 0 &&
-            this.isConnected &&
-            this.ws.readyState === WebSocket.OPEN &&
-            this.extensionAvailable;
+        this.log('Sending client identification...', 'DEBUG', '_identifyClient');
+        this.socket.emit('/identify', { clientType: 'xfetch' });
+    }
+
+    _processQueue() {
+        if (this.requestQueue.length === 0) {
+            return;
+        }
+
+        const canProcess = this.isConnected && this.isIdentified && this.extensionAvailable;
 
         if (canProcess) {
-            console.log(`Processing ${this.requestQueue.length} queued requests...`, 'INFO', 'processQueue');
-            const queue = [...this.requestQueue]
+            this.log(`Processing ${this.requestQueue.length} queued requests...`, 'INFO', '_processQueue');
+            const queue = [...this.requestQueue];
             this.requestQueue = [];
 
-
-            //clear any give up timers
-            if (this._giveUpTimers.length > 0) {
-                this._giveUpTimers.forEach(timer => clearTimeout(timer));
-                this._giveUpTimers = []
-            }
-
-            // process queue items
-            queue.forEach(({ url, options, resolve, reject, retryCount }) => {
-                this._sendRequest(url, options, resolve, reject, retryCount)
-            })
-        } else if (this.requestQueue.length > 0) {
-            this.log(`(${this.requestQueue.length}) queued requests: connected=${this.isConnected}, readyState=${this.ws.readyState}, extensionAvailable=${this.extensionAvailable}`, 'WARN', 'processQueue');
+            queue.forEach(({ url, options, resolve, reject }) => {
+                this._sendRequest(url, options, resolve, reject);
+            });
+        } else {
+            this.log(
+                `Cannot process queue: connected=${this.isConnected}, identified=${this.isIdentified}, extensionAvailable=${this.extensionAvailable}`,
+                'DEBUG',
+                '_processQueue'
+            );
         }
     }
 
-
-    fetch(url, options = {}) {
+    async fetch(url, options = {}) {
         return new Promise((resolve, reject) => {
-            if (this.isConnected && this.ws.readyState === WebSocket.OPEN && this.extensionAvailable && this.isIdentified) {
-                //if all systems give green light, send request immediately
-                this._sendRequest(url, options, resolve, reject, 0);
+            if (this.isConnected && this.isIdentified && this.extensionAvailable) {
+                this._sendRequest(url, options, resolve, reject);
             } else {
                 this.log(`Connection not ready, queuing request for ${url}...`, 'WARN', 'fetch');
+                this.requestQueue.push({ url, options, resolve, reject });
 
-
-                // add request to queue 
-                this.requestQueue.push({ url, options, resolve, reject, retryCount: 0 })
-
-                //reconnect if needed
-                if (!this.isConnected && this.ws.readyState !== WebSocket.CONNECTING) {
-                    this.reconnect();
-                }
-
-                if(!this.isIdentified){
-                    this.log(`Not identified, queuing request for ${url}...`, 'WARN', 'fetch');
-                    this.isIdentifiedTimer = setInterval((resolve, reject, counter = 0) => {
-                        if(counter >= 3){
-                            this.log(`Failed to identify with server, rejecting promise`, 'ERROR', 'fetch');
-                            reject(new Error('Failed to identify with server'));
-                        }else{
-                            this.sendClientIdentification(resolve, reject, counter + 1);
-                            
-                        }
-                    }, this.config.timeout);
-                }
-
-                // set timeout to reject if request isnt processed within timeout period 
-                const giveUpTimer = setTimeout(() => {
-
-                    const index = this.requestQueue.findIndex(req =>
-                        req.url === url &&
-                        req.resolve === resolve &&
-                        req.reject === reject
-                    )
+                // Set timeout for queued request
+                const queueTimeout = setTimeout(() => {
+                    const index = this.requestQueue.findIndex(
+                        (req) => req.url === url && req.resolve === resolve && req.reject === reject
+                    );
 
                     if (index !== -1) {
                         this.requestQueue.splice(index, 1);
-
-                        this.log(`Timeout reached for request to ${url}, removing from queue and rejecting promise`, 'WARN', 'fetch');
+                        this.log(`Timeout reached for queued request to ${url}`, 'WARN', 'fetch');
 
                         if (this.isConnected && !this.extensionAvailable) {
-                            reject(new Error(`No extension client available after ${this.config.timeout}ms`))
+                            reject(new Error(`No extension client available after ${this.config.timeout}ms`));
                         } else if (!this.isConnected) {
-                            reject(new Error(`Failed to establish WebSocket connection within ${this.config.timeout}ms`))
+                            reject(new Error(`Failed to establish WebSocket connection within ${this.config.timeout}ms`));
                         } else {
-                            reject(new Error(`Request timeout after ${this.config.timeout}ms`))
+                            reject(new Error(`Request timeout after ${this.config.timeout}ms`));
                         }
-
                     }
+                }, this.config.timeout);
 
-                }, this.config.timeout)
-
-                this._giveUpTimers.push(giveUpTimer)
+                // Store timeout ID for cleanup
+                this.requestQueue[this.requestQueue.length - 1].timeoutId = queueTimeout;
             }
-        })
+        });
     }
 
+    _sendRequest(url, options, resolve, reject) {
+        const requestId = uuidv4();
 
-    getCookies(url){
-        const domain = new URL(url).hostname;
-        return Array.from(this.cookies.get(domain) || [])
-    }
+        // Add cookies from cookie jar if requested
+        if (options.cookiejar === true) {
+            options.cookies = this.getCookies(url);
+        }
 
-    setCookies(url, cookies){
-        const domain = new URL(url).hostname;
-        this.cookies.set(domain, {...cookies})
-    }
+        // Store promise callbacks
+        this.pendingRequests.set(requestId, { resolve, reject, url, options });
 
-
-    _sendRequest(url, options, resolve, reject, retryCount) {
-        const requestId = uuidv4()
-
-        // store promise callbacks 
-        this.pendingRequests[requestId] = { resolve, reject }
-
-        //set up timeout handling for this requests
+        // Set up timeout handling
         const timeoutId = setTimeout(() => {
-            if (this.pendingRequests[requestId]) {
+            if (this.pendingRequests.has(requestId)) {
                 this.log(`Request ${requestId} timed out after ${this.config.timeout}ms`, 'WARN', '_sendRequest');
-                delete this.pendingRequests[requestId]
+                this.pendingRequests.delete(requestId);
+                reject(new Error(`Request failed: timeout after ${this.config.timeout}ms`));
             }
+        }, this.config.timeout);
 
+        this.pendingRequests.get(requestId).timeoutId = timeoutId;
 
-            if (retryCount < this.config.maxRetries) {
-                this.log(`Request timed out, retrying (${retryCount + 1}/${this.config.maxRetries})...`, 'WARN', '_sendRequest');
-                this._sendRequest(url, options, resolve, reject, retryCount + 1)
-
-            } else {
-                this.log(`Max retries (${this.config.maxRetries}) reached, rejecting promise`, 'ERROR', '_sendRequest');
-                reject(new Error(`Request failed after ${this.config.maxRetries} retries`))
-            }
-        }, this.config.timeout)
-
-        this.pendingRequests[requestId].timeoutId = timeoutId;
-
-        //send request 
-        options.cookiejar === true ? options.cookies = this.getCookies(url) : 
-        options.cookies ? options.cookies : null;
-
-        const message = JSON.stringify({ url, options, id: requestId })
-
+        // Send request
         try {
-            this.log(`Sending request ${requestId} to WebSocket server...`, 'DEBUG', '_sendRequest');
-            this.ws.send(message)
+            this.log(`Sending fetch request ${requestId} to ${url}`, 'DEBUG', '_sendRequest');
+            this.socket.emit('/fetch', { url, options, id: requestId });
         } catch (err) {
-
             this.log(`Error sending request ${requestId}: ${err.message}`, 'ERROR', '_sendRequest');
-            clearTimeout(timeoutId)
-
-            if (retryCount < this.config.maxRetries) {
-
-                this.log(`Send failed, retrying (${retryCount + 1}/${this.config.maxRetries})...`, 'WARN', '_sendRequest');
-                setTimeout(() => this._sendRequest(url, options, resolve, reject, retryCount + 1), 1000)
-
-            } else {
-
-                this.log(`Max retries (${this.config.maxRetries}) reached, rejecting promise`, 'ERROR', '_sendRequest');
-                reject(new Error(`Failed to send request after ${this.config.maxRetries} retries: ${err.message}`))
-
-            }
-        }
-
-
-    }
-
-
-
-    reconnect() {
-        this.log('Attempting to reconnect...', 'INFO', 'reconnect');
-        try { this.ws.close() } catch (err) {//ignore}
-
-            this.ws = new WebSocket(this.wsUrl);
-            this.setupWebSocket();
+            clearTimeout(timeoutId);
+            this.pendingRequests.delete(requestId);
+            reject(new Error(`Failed to send request: ${err.message}`));
         }
     }
 
+    getCookies(url) {
+        const domain = new URL(url).hostname;
+        return Array.from(this.cookies.get(domain) || []);
+    }
+
+    setCookies(url, cookies) {
+        const domain = new URL(url).hostname;
+        this.cookies.set(domain, cookies);
+    }
 
     getStatus() {
         return {
             isConnected: this.isConnected,
+            isIdentified: this.isIdentified,
             extensionAvailable: this.extensionAvailable,
-            pendingRequests: Object.keys(this.pendingRequests).length,
+            pendingRequests: this.pendingRequests.size,
             requestQueue: this.requestQueue.length,
-            reconnectAttempts: this.reconnectAttempts
-        }
+        };
     }
 
-    sendClientIdentification() {
-        try {
-            const message = JSON.stringify({
-                type: 'identify',
-                clientType: 'xfetch'
-            });
+    async close() {
+        if (this.socket) {
+            this.log('Closing WebSocket connection', 'INFO', 'close');
 
-            this.ws.send(message);
-            this.log('Submitted client identification', 'INFO', 'sendClientIdentification');
-        } catch (err) {
-            this.isIdentifiedTimer ? clearInterval(this.isIdentifiedTimer) : null;
-            this.isIdentifiedTimer = setInterval(() => {
-                this.log('Failed to identify with server, retrying...', 'ERROR', 'sendClientIdentification');
-                this.sendClientIdentification();
-            }, 1000);
-
-            this.log({ type: 'error', from: 'sendClientIdentification', message: err.message }, 'ERROR', 'sendClientIdentification');
-        }
-    }
-
-    sendHeartbeat() {
-        if (this.isConnected && this.ws.readyState === WebSocket.OPEN) {
-            try {
-
-        
-
-                const message = JSON.stringify({ type: 'ping' });
-                this.ws.send(message);
-                this.log('Sent heartbeat', 'DEBUG', 'sendHeartbeat');
-            } catch (error) {
-                this.log({ type: 'error', from: 'sendHeartbeat', message: error.message }, 'ERROR', 'sendHeartbeat');
-            }
-        }
-    }
-
-    sendPong() {
-        if (this.isConnected && this.ws.readyState === WebSocket.OPEN) {
-            try {
-                const message = JSON.stringify({ type: 'pong' });
-                this.ws.send(message);
-                this.log('Sent pong', 'DEBUG', 'sendPong');
-            } catch (error) {
-                this.log({ type: 'error', from: 'sendPong', message: error.message }, 'ERROR', 'sendPong');
-            }
-        }
-    }
-
-    close() {
-        if (this.isConnected && this.ws.readyState === WebSocket.OPEN) {
-
-            //clear timers
-            if (this.heartBeatTimer) {
-                clearInterval(this.heartBeatTimer);
+            // Reject all pending requests
+            for (const [id, pending] of this.pendingRequests.entries()) {
+                if (pending.timeoutId) {
+                    clearTimeout(pending.timeoutId);
+                }
+                pending.reject(new Error('Client closed'));
             }
 
-            if (this.queueCheckTimer) {
-                clearInterval(this.queueCheckTimer);
-            }
+            this.pendingRequests.clear();
+            this.requestQueue = [];
 
-            try {
-                this.ws.close();
-                this.log('WebSocket connection closed', 'INFO', 'close');
-            } catch (error) {
-                this.log({ type: 'error', from: 'close', message: error.message }, 'ERROR', 'close');
-            }
+            this.socket.close();
+            this.socket = null;
+            this.isConnected = false;
+            this.extensionAvailable = false;
+            this.isIdentified = false;
         }
     }
 }
 
-
-module.exports = Xfetch; 
+module.exports = Xfetch;
