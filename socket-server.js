@@ -95,22 +95,30 @@ app.on('/identify', (req) => {
         return;
     }
 
+    // Check if this socket already has a client type (re-identification)
+    const previousClientType = req.get('clientType');
+    const isFirstIdentification = !previousClientType;
+
     // Store client type
     req.set('clientType', clientType);
 
     // Add tag for easy filtering
     req.tag(`*${clientType}`);
 
-    // Update stats
-    if (clientType === 'extension') {
-        stats.extensionClients++;
-    } else if (clientType === 'xfetch') {
-        stats.xfetchClients++;
-    }
+    // Update stats only on first identification
+    if (isFirstIdentification) {
+        if (clientType === 'extension') {
+            stats.extensionClients++;
+        } else if (clientType === 'xfetch') {
+            stats.xfetchClients++;
+        }
 
-    console.log(`Client ${req.id} identified as ${clientType}`);
-    console.log(`  Extension clients: ${stats.extensionClients}`);
-    console.log(`  Xfetch clients: ${stats.xfetchClients}`);
+        console.log(`Client ${req.id} identified as ${clientType}`);
+        console.log(`  Extension clients: ${stats.extensionClients}`);
+        console.log(`  Xfetch clients: ${stats.xfetchClients}`);
+    } else {
+        console.log(`Client ${req.id} re-identified as ${clientType} (no count change)`);
+    }
 
     // Send confirmation
     req.emit('@identified', { clientType });

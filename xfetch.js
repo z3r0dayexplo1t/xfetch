@@ -56,8 +56,7 @@ class Xfetch {
             this.isConnected = true;
             this.log('WebSocket connection established', 'INFO', '_initSocket');
 
-            // Identify with server
-            this._identifyClient();
+            // Server will send @identify event, we'll respond to that
         } catch (err) {
             this.log(`Failed to connect: ${err.message}`, 'ERROR', '_initSocket');
             throw err;
@@ -93,8 +92,8 @@ class Xfetch {
         this.socket.on('@reconnect', () => {
             this.log('Reconnected to server', 'INFO', '_setupEventHandlers');
             this.isConnected = true;
-            this._identifyClient();
-            this._processQueue();
+            // Server will send @identify on new connection, we'll respond to that
+            // Don't need to identify here as it would cause double identification
         });
 
         // Server requests identification
