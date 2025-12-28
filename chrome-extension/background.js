@@ -50,7 +50,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             break;
     }
 
-    return true; // Keep message channel open for async responses
+    // No need to return true - we're not using sendResponse callback
+    // We send responses via chrome.runtime.sendMessage instead
 });
 
 /**
