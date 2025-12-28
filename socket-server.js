@@ -219,8 +219,8 @@ app.on('/response', (req) => {
     const responseTime = Date.now() - pendingRequest.timestamp;
     console.log(`Request ${requestId} completed in ${responseTime}ms`);
 
-    // Forward response to xfetch client
-    emitToSocket(pendingRequest.socketId, '/fetch-response', {
+    // Forward response to xfetch client using native emitTo
+    app.emitTo(pendingRequest.socketId, '/fetch-response', {
         id: requestId,
         response,
         error
@@ -240,20 +240,6 @@ app.on('/stats', (req) => {
         pendingRequests: pendingRequests.size,
     });
 });
-
-/**
- * Helper: Send message to specific socket by ID
- */
-function emitToSocket(socketId, event, data) {
-    for (const socket of app.sockets) {
-        if (socket.id === socketId) {
-            socket.emit(event, data);
-            return true;
-        }
-    }
-    console.warn(`Socket ${socketId} not found`);
-    return false;
-}
 
 /**
  * Helper: Forward request to extension client
@@ -312,7 +298,7 @@ async function retryPendingRequest(requestId) {
                 setTimeout(() => retryPendingRequest(requestId), 2000);
             } else {
                 // Give up
-                emitToSocket(pending.socketId, '/fetch-response', {
+                app.emitTo(pending.socketId, '/fetch-response', {
                     id: requestId,
                     error: 'Failed to forward request to extension after 3 retries'
                 });
@@ -326,7 +312,7 @@ async function retryPendingRequest(requestId) {
             setTimeout(() => retryPendingRequest(requestId), 2000);
         } else {
             // Give up
-            emitToSocket(pending.socketId, '/fetch-response', {
+            app.emitTo(pending.socketId, '/fetch-response', {
                 id: requestId,
                 error: 'No extension clients available after 3 retry attempts'
             });
