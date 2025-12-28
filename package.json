@@ -1,6 +1,22 @@
 {
+  "name": "xfetch",
+  "version": "2.0.0",
+  "description": "Automate browser fetch requests via WebSocket without Chrome DevTools protocol",
+  "main": "xfetch.js",
+  "scripts": {
+    "start": "node socket-server.js",
+    "test": "node test.js"
+  },
+  "keywords": [
+    "websocket",
+    "fetch",
+    "browser-automation",
+    "chrome-extension"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
-    "uuid": "^11.1.0",
-    "ws": "^8.18.3"
+    "emit.gg": "^1.0.4",
+    "uuid": "^11.1.0"
   }
 }

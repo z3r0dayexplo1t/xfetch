@@ -21,7 +21,7 @@
       "service_worker": "background.js"
     },
     "web_accessible_resources": [{
-      "resources": ["worker.html", "worker.js", "styles/*", "cookieJar.js"],
+      "resources": ["worker.html", "worker.js", "emit-browser.js", "styles/*", "cookieJar.js"],
       "matches": ["<all_urls>"]
     }]
 }
